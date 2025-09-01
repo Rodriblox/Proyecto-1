@@ -1,0 +1,320 @@
+#include <Arduino.h> 
+#include <WiFi.h>
+#include "AdafruitIO_WiFi.h"
+#include "driver/mcpwm.h"   // ✅ Usamos MCPWM en lugar de ESP32Servo
+
+/* ====== Credenciales ====== */
+#define IO_USERNAME  "Rodriiblox"
+#define IO_KEY       "aio_VBEE34Xmtuk8BoGGVGz1shPJ5AJL"
+#define WIFI_SSID    "Rodrigo"
+#define WIFI_PASS    "Ruperto56"
+
+AdafruitIO_WiFi io(IO_USERNAME, IO_KEY, WIFI_SSID, WIFI_PASS);
+AdafruitIO_Feed*temperature= io.feed("temperatureFeed");
+AdafruitIO_Feed*servoFeed= io.feed("servoFeed");
+
+/* ====== Pines ====== */
+// Segmentos (a,b,c,d,e,f,g,p)
+const int SEG_PINS[8]   = {23, 22, 21, 19, 18, 5, 4, 17}; // TX2 = GPIO17
+
+// Dígitos
+const int DIGIT_PINS[4] = {14, 27, 26, 15};
+
+// LED RGB (cátodo común)
+const int PIN_R = 25, PIN_G = 33, PIN_B = 32;
+
+// LM35 y botón
+const int LM35_PIN  = 34;
+const int BTN_PIN   = 16; // RX2 = GPIO16
+void refresh7Seg();  // Declaración anticipada
+// Servo
+const int SERVO_PIN = 13;   // ✅ Usamos GPIO13 en lugar de 2
+
+/* ====== Configuración ====== */
+const bool COMMON_ANODE      = false; 
+const bool RGB_COMMON_ANODE  = false; 
+const int CH_R = 0, CH_G = 1, CH_B = 2;
+const int LEDC_FREQ = 5000, LEDC_RES = 8;
+const int LM35_SAMPLES = 32;
+const float ADC_REF_V = 3.3f;
+const int ADC_MAX = 4095;
+const float T_MIN = 15.0f, T_MAX = 35.0f;
+const uint32_t DIGIT_PERIOD_US = 250;   // 500 us por dígito
+const uint32_t DEBOUNCE_US = 250000;     // 0.25s para evitar rebotes múltiples
+
+/* ====== Estado global ====== */
+volatile bool requestRead = false;
+volatile uint32_t lastButtonUs = 0;
+int digitsToShow[4] = {-1, -1, -1, -1};
+bool dpOnDigit[4] = {false, false, false, false};
+uint8_t curDigit = 0;
+uint32_t lastDigitUs = 0;
+float lastTempC = 0.0f;
+hw_timer_t *displayTimer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+unsigned long lastRefreshTime = 0;
+const unsigned long refreshInterval = 2;  // ms
+/* ====== Mapa segmentos ====== */
+const uint8_t DIGIT_MAP[10] = {
+  0b0111111, 0b0000110, 0b1011011, 0b1001111,
+  0b1100110, 0b1101101, 0b1111101, 0b0000111,
+  0b1111111, 0b1101111
+};
+
+enum class Color { OFF, RED, GREEN, BLUE, YELLOW };
+
+/* ====== MCPWM Servo ====== */
+void servoInitMCPWM() {
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, SERVO_PIN);
+
+  mcpwm_config_t cfg = {};
+  cfg.frequency = 50;                        // 50 Hz → periodo 20 ms
+  cfg.cmpr_a   = 0;                          // duty % inicial
+  cfg.counter_mode = MCPWM_UP_COUNTER;
+  cfg.duty_mode    = MCPWM_DUTY_MODE_0;
+  mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_0, &cfg);
+
+  // Pulso inicial ~1500 µs (90° aprox.)
+  mcpwm_set_duty(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, (1500.0f/20000.0f)*100.0f);
+  mcpwm_set_duty_type(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, MCPWM_DUTY_MODE_0);
+}
+
+static inline uint16_t angleToUs(int angle) {
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  return (uint16_t)(500 + (2000.0f * angle / 180.0f));  // 500–2500 µs
+}
+
+void servoWriteAngle(int angle) {
+  uint16_t us = angleToUs(angle);
+  float duty = (us / 20000.0f) * 100.0f;     // 20 ms periodo
+  mcpwm_set_duty(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, duty);
+}
+
+/* ====== Funciones display ====== */
+void digitEnable(int d, bool on) {
+  bool lvl = (COMMON_ANODE ? !on : on);
+  digitalWrite(DIGIT_PINS[d], lvl ? HIGH : LOW);
+}
+void IRAM_ATTR onDisplayTimer() {
+  portENTER_CRITICAL_ISR(&timerMux);
+  refresh7Seg();  // 🔁 Refrescar display sin depender del loop
+  portEXIT_CRITICAL_ISR(&timerMux);
+}
+void setSegmentsRaw(uint8_t segs, bool dp) {
+  for (int i = 0; i < 7; i++) {
+    bool on = (segs >> i) & 0x01;
+    bool lvl = (COMMON_ANODE ? !on : on);
+    digitalWrite(SEG_PINS[i], lvl ? HIGH : LOW);
+  }
+  bool lvlDP = (COMMON_ANODE ? !dp : dp);
+  digitalWrite(SEG_PINS[7], lvlDP ? HIGH : LOW);
+}
+
+void refresh7Seg() {
+  uint32_t now = micros();
+  if (now - lastDigitUs < DIGIT_PERIOD_US) return;
+  lastDigitUs = now;
+
+  digitEnable(curDigit, false);
+  curDigit = (curDigit + 1) & 0x03;
+
+  int val = digitsToShow[curDigit];
+  if (val >= 0 && val <= 9)
+    setSegmentsRaw(DIGIT_MAP[val], dpOnDigit[curDigit]);
+  else
+    setSegmentsRaw(0, false);
+
+  digitEnable(curDigit, true);
+}
+
+void showTemperature(float tC) {
+  if (tC < 0) tC = 0;
+  if (tC > 99.99f) tC = 99.99f;
+  int v = int(tC * 100 + 0.5f); // 2 decimales
+  digitsToShow[0] = (v / 1000) % 10;
+  digitsToShow[1] = (v / 100) % 10;
+  digitsToShow[2] = (v / 10) % 10;
+  digitsToShow[3] = v % 10;
+  dpOnDigit[0] = false;
+  dpOnDigit[1] = true; // XX.XX
+  dpOnDigit[2] = false;
+  dpOnDigit[3] = false;
+}
+
+/* ====== Sensor y actuadores ====== */
+float readLM35Celsius() {
+  long acc = 0;
+  for (int i = 0; i < LM35_SAMPLES; i++) {
+    acc += analogRead(LM35_PIN);
+    delayMicroseconds(10);   // mantuve tu ajuste
+  }
+  float avg = float(acc) / LM35_SAMPLES;
+  float volts = avg * ADC_REF_V / ADC_MAX;
+  return volts * 100.0f + 10.0f;  // 🔹 Ajuste automático (+10 °C)
+}
+
+void rgbWrite(Color c) {
+  int r = 0, g = 0, b = 0;
+  switch (c) {
+    case Color::RED:    r = 255; break;
+    case Color::GREEN:  g = 255; break;
+    case Color::BLUE:   b = 255; break;
+    case Color::YELLOW: r = 255; g = 180; break;
+    default: break;
+  }
+  if (RGB_COMMON_ANODE) { r = 255 - r; g = 255 - g; b = 255 - b; }
+  ledcWrite(CH_R, r);
+  ledcWrite(CH_G, g);
+  ledcWrite(CH_B, b);
+}
+
+/* ====== 🔹 Lógica del servo por rangos ====== */
+void setSemaphoreForTemp(float tC) {
+  if (tC < 22.0f) {
+    rgbWrite(Color::GREEN);
+    servoWriteAngle(45);   // ➡️ Verde = 45°
+  } 
+  else if (tC > 22.0f && tC <= 25.0f) {
+    rgbWrite(Color::BLUE);
+    servoWriteAngle(90);   // ➡️ Azul = 90°
+  } 
+  else {
+    rgbWrite(Color::RED);
+    servoWriteAngle(135);  // ➡️ Rojo = 135°
+  }
+}
+
+int angleForTemp(float tC) {
+  if (tC < T_MIN) tC = T_MIN;
+  if (tC > T_MAX) tC = T_MAX;
+  float ratio = (tC - T_MIN) / (T_MAX - T_MIN);
+  return int(ratio * 180.0f + 0.5f);
+}
+
+/* ====== Botón ISR ====== */
+void IRAM_ATTR onButtonISR() {
+  uint32_t now = micros();
+  if (now - lastButtonUs >= DEBOUNCE_US) {
+    requestRead = true;
+    lastButtonUs = now;
+  }
+}
+
+/* ====== Setup ====== */
+void setup() {
+  Serial.begin(115200);
+  delay(200); // pequeño retardo para asegurar que Serial esté listo
+  Serial.println("\n[BOOT] Iniciando...");
+
+  // WiFi (máx. 2s de espera)
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Conectando a WiFi");
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(100);
+    Serial.print(".");
+    retries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\n[OK] Conectado a WiFi. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[ERROR] No se pudo conectar a WiFi");
+  }
+
+  // Conexión Adafruit IO (máx. 2s de espera)
+  io.connect();
+  Serial.print("Conectando a Adafruit IO");
+  int aioRetries = 0;
+  while (io.status() < AIO_CONNECTED && aioRetries < 20) {
+    io.run();
+    delay(100);
+    Serial.print(".");
+    aioRetries++;
+  }
+  if (io.status() == AIO_CONNECTED)
+    Serial.println("\n[OK] Conectado a Adafruit IO");
+  else
+    Serial.println("\n[ERROR] No se pudo conectar a Adafruit IO");
+
+  lastButtonUs = micros();
+
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_PIN), onButtonISR, FALLING);
+
+  for (int i = 0; i < 8; i++) pinMode(SEG_PINS[i], OUTPUT);
+  for (int d = 0; d < 4; d++) pinMode(DIGIT_PINS[d], OUTPUT);
+  for (int d = 0; d < 4; d++) digitEnable(d, false);
+
+  showTemperature(0.0f);
+
+  ledcSetup(CH_R, LEDC_FREQ, LEDC_RES);
+  ledcSetup(CH_G, LEDC_FREQ, LEDC_RES);
+  ledcSetup(CH_B, LEDC_FREQ, LEDC_RES);
+  ledcAttachPin(PIN_R, CH_R);
+  ledcAttachPin(PIN_G, CH_G);
+  ledcAttachPin(PIN_B, CH_B);
+  rgbWrite(Color::OFF);
+
+  servoInitMCPWM();       // ✅ Inicializamos MCPWM
+  servoWriteAngle(90);    // posición inicial
+
+  Serial.println("[SETUP] Listo.");
+  displayTimer = timerBegin(0, 80, true);  // 80 prescaler → 1 µs por tick
+  timerAttachInterrupt(displayTimer, &onDisplayTimer, true);
+  timerAlarmWrite(displayTimer, 2000, true);  // 2000 µs = 2 ms
+  timerAlarmEnable(displayTimer);
+}
+
+/* ====== Loop ====== */
+void loop() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastRefreshTime >= refreshInterval) {
+    lastRefreshTime = currentTime;
+    // 🔁 Refrescar display cada 2 ms
+  }
+
+  io.run();  // Mantener conexión con Adafruit IO
+
+  if (requestRead) {
+    noInterrupts();
+    requestRead = false;
+    interrupts();
+
+    float tempC = readLM35Celsius();
+    lastTempC = tempC;
+
+    showTemperature(tempC);
+
+    // 🔹 Determinar ángulo por rango
+    int angleSet;
+    if (tempC < 22.0f) {
+      rgbWrite(Color::GREEN);
+      angleSet = 45;
+    } 
+    else if (tempC > 22.0f && tempC <= 25.0f) {
+      rgbWrite(Color::YELLOW);
+      angleSet = 90;
+    } 
+    else {
+      rgbWrite(Color::RED);
+      angleSet = 135;
+    }
+
+    servoWriteAngle(angleSet);   // ✅ Ahora usamos MCPWM
+
+    // 🔹 Mostrar por serial
+    Serial.printf("[READ] Temp: %.2f °C → Servo: %d°\n", tempC, angleSet);
+
+    // 🔹 Enviar a Adafruit IO
+    if (io.status() == AIO_CONNECTED) {
+      temperature->save(String(tempC, 2));
+      servoFeed->save(angleSet);
+      io.run();
+      Serial.println("[AIO] Datos enviados");
+    } else {
+      Serial.println("[AIO] No conectado");
+    }
+  }
+}
